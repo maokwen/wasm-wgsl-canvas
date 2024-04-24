@@ -1,25 +1,13 @@
 mod logger;
 mod utils;
 
-use wasm_bindgen::{prelude::wasm_bindgen, JsCast};
+use wasm_bindgen::prelude::wasm_bindgen;
 
 #[wasm_bindgen]
 pub async fn run() {
     logger::init_logger();
 
-    let mut canvas_list: Vec<web_sys::HtmlCanvasElement> = vec![];
-    web_sys::window()
-        .and_then(|win| win.document())
-        .and_then(|doc| {
-            let list = doc.get_elements_by_class_name("wgpu-canvas");
-            for i in 0..list.length() {
-                let parent = list.item(i).unwrap();
-                let canvas = initialize_canvas(&parent);
-                canvas_list.push(canvas);
-            }
-            Some(())
-        })
-        .expect("Failed to get canvas list");
+    let canvas_list = initialize_canvas();
 
     if canvas_list.is_empty() {
         log::info!("No canvas found");
@@ -146,18 +134,25 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     }
 }
 
-pub fn initialize_canvas(element: &web_sys::Element) -> web_sys::HtmlCanvasElement {
+pub fn initialize_canvas() -> Vec<web_sys::HtmlCanvasElement> {
     use wasm_bindgen::JsCast;
 
+    let mut canvas_list: Vec<web_sys::HtmlCanvasElement> = vec![];
     web_sys::window()
         .and_then(|win| win.document())
         .and_then(|doc| {
-            doc.create_element("canvas")
-                .and_then(|e| element.append_child(&e))
-                .ok()
-                .and_then(|e| e.dyn_into::<web_sys::HtmlCanvasElement>().ok())
+            let list = doc.get_elements_by_class_name("wgpu-canvas");
+            for i in 0..list.length() {
+                let canvas = list
+                    .item(i)
+                    .unwrap()
+                    .dyn_into::<web_sys::HtmlCanvasElement>()
+                    .expect("Failed to initialize canvas");
+                canvas_list.push(canvas);
+            }
+            Some(canvas_list)
         })
-        .expect("Failed to initialize canvas")
+        .unwrap()
 }
 
 struct Context<'canvas> {
@@ -179,7 +174,7 @@ async fn initialize_context(canvas: web_sys::HtmlCanvasElement) -> Context<'stat
         let surface_target = wgpu::SurfaceTarget::Canvas(canvas.clone());
         let surface = instance
             .create_surface(surface_target)
-            .expect("could not create surface from canvas");
+            .expect("Could not create surface from canvas");
 
         log::info!("Surface info: {:#?}", surface);
 
@@ -189,7 +184,7 @@ async fn initialize_context(canvas: web_sys::HtmlCanvasElement) -> Context<'stat
                 ..wgpu::RequestAdapterOptions::default()
             })
             .await
-            .unwrap();
+            .expect("Could not get adapter");
 
         log::info!("Adapter info: {:#?}", adapter.get_info());
 
@@ -203,7 +198,7 @@ async fn initialize_context(canvas: web_sys::HtmlCanvasElement) -> Context<'stat
             .expect("Surface isn't supported by the adapter.");
 
         let surface_formats = surface.get_capabilities(&adapter).formats;
-        log::info!("Suface formats: {:#?}", surface_formats);
+        log::info!("Support texture formats: {:#?}", surface_formats);
 
         log::info!("Surface configuration info: {:#?}", config);
 
@@ -488,3 +483,6 @@ pub fn initialize_date_buffers(
 
     (bind_group, date_buffer)
 }
+
+#[wasm_bindgen]
+pub fn on_canvas_resize() {}
