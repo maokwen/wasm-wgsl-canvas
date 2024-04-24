@@ -136,8 +136,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
                 timestamp_writes: None,
             });
 
-            //render_pass.set_pipeline(&render_pipeline);
-            //render_pass.draw(0..3, 0..1);
+            render_pass.set_pipeline(&render_pipeline);
+            render_pass.draw(0..3, 0..1);
         }
 
         // submit will accept anything that implements IntoIter
@@ -201,6 +201,11 @@ async fn initialize_context(canvas: web_sys::HtmlCanvasElement) -> Context<'stat
         let config = surface
             .get_default_config(&adapter, width, height)
             .expect("Surface isn't supported by the adapter.");
+
+        let surface_formats = surface.get_capabilities(&adapter).formats;
+        log::info!("Suface formats: {:#?}", surface_formats);
+
+        log::info!("Surface configuration info: {:#?}", config);
 
         (canvas, instance, surface, adapter, device, queue, config)
     };
