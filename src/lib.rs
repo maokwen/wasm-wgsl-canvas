@@ -26,6 +26,7 @@ pub async fn run() {
             r##"
 struct VertexOutput {
     @builtin(position) clip_position: vec4<f32>,
+    @location(0) position: vec2<f32>,
 };
 
 @vertex
@@ -36,18 +37,21 @@ fn vs_main(
     let x = f32(1 - i32(in_vertex_index)) * 0.5;
     let y = f32(i32(in_vertex_index & 1u) * 2 - 1) * 0.5;
     out.clip_position = vec4<f32>(x, y, 0.0, 1.0);
+    out.position = vec2<f32>(x, y);
     return out;
 }             
 
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
-    return vec4<f32>(0.3, 0.2, 0.1, 1.0);
+    return vec4<f32>(in.position, 0.5, 1.0);
 }
 
 "##
             .into(),
         ),
     };
+
+    let mut idx = 0;
 
     for context in context_list {
         let layout = initialize_pipeline_layout(&context.device);
@@ -125,7 +129,9 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             });
 
             render_pass.set_pipeline(&render_pipeline);
-            render_pass.draw(0..3, 0..1);
+            render_pass.draw((0 + idx)..(3 + idx), 0..1);
+            log::info!("Triangle: {:#?} {:#?} ", (0 + idx), (3 + idx));
+            idx += 1;
         }
 
         // submit will accept anything that implements IntoIter
@@ -232,7 +238,7 @@ pub async fn initialize_device(adapter: &wgpu::Adapter) -> (wgpu::Device, wgpu::
             &wgpu::DeviceDescriptor {
                 label: None,
                 required_features: wgpu::Features::empty(),
-                required_limits: wgpu::Limits::downlevel_webgl2_defaults(),
+                required_limits: wgpu::Limits::downlevel_defaults(), //wgpu::Limits::downlevel_webgl2_defaults(),
             },
             None, // Trace path
         )
