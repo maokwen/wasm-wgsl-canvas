@@ -29,6 +29,10 @@ web-sys = { version = "0.3.69", features = [
   "Request",
   "Response",
 ]}
+reqwest = "0.12"
+anyhow = "1.0"
+image = "0.25"
+bytemuck = { version = "1.15", features = ["derive"] }
 
 # The `console_error_panic_hook` crate provides better debugging of panics by
 # logging them with `console.error`. This is great for development, but requires

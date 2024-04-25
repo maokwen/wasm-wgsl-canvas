@@ -1,5 +1,8 @@
 mod logger;
+mod res;
 mod utils;
+
+use std::mem;
 
 use wasm_bindgen::prelude::wasm_bindgen;
 
@@ -54,7 +57,14 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let mut idx = 0;
 
     for context in context_list {
-        let layout = initialize_pipeline_layout(&context.device);
+        let (layout, perframe_layout, texture_layout, sampler_layout) =
+            initialize_pipeline_layout(&context.device);
+        let (perframe_bind_group, time_buffer, mouse_buffer) =
+            initialize_bind_group_perframe(&context.device, &perframe_layout);
+        let (texture_bind_group, channel0, view0, channel1, view1) =
+            initialize_bind_group_texture(&context.device, &texture_layout);
+        let sampler_bind_group = initialize_bind_group_sampler(&context.device, &sampler_layout);
+
         let shader = context.device.create_shader_module(shader_desc.clone());
         let render_pipeline =
             context
@@ -128,9 +138,32 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
                 timestamp_writes: None,
             });
 
+            let time_uniform = TimeUniform {
+                frame: 1,
+                elapsed: 1.0,
+                delta: 1.0,
+            };
+
+            let mouse_uniform = MouseUniform {
+                pos: [0, 0],
+                click: 0,
+            };
+
+            context
+                .queue
+                .write_buffer(&time_buffer, 0, bytemuck::cast_slice(&[time_uniform]));
+
+            context
+                .queue
+                .write_buffer(&mouse_buffer, 0, bytemuck::cast_slice(&[mouse_uniform]));
+
             render_pass.set_pipeline(&render_pipeline);
+            render_pass.set_bind_group(0, &perframe_bind_group, &[]);
+            render_pass.set_bind_group(1, &texture_bind_group, &[]);
+            render_pass.set_bind_group(2, &sampler_bind_group, &[]);
             render_pass.draw((0 + idx)..(3 + idx), 0..1);
             log::info!("Triangle: {:#?} {:#?} ", (0 + idx), (3 + idx));
+
             idx += 1;
         }
 
@@ -246,155 +279,164 @@ pub async fn initialize_device(adapter: &wgpu::Adapter) -> (wgpu::Device, wgpu::
 
     match bundle {
         Ok(b) => b,
-        Err(_e) => panic!("Failed to initialize device: {_e}"),
+        Err(e) => panic!("Failed to initialize device: {}", e),
     }
 }
 
-pub fn initialize_pipeline_layout(device: &wgpu::Device) -> wgpu::PipelineLayout {
-    // binding(0) iTime
-    // binding(1) iTimeDelta
-    // binding(2) iFrame
-    let perframe_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-        label: Some("Per-frame Information Bind Group Layout"),
-        entries: &[
-            wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
+pub fn initialize_pipeline_layout(
+    device: &wgpu::Device,
+) -> (
+    wgpu::PipelineLayout,
+    wgpu::BindGroupLayout,
+    wgpu::BindGroupLayout,
+    wgpu::BindGroupLayout,
+) {
+    // group(0)
+    // binding(0) var<uniform> _time: Time { frame, elapsed }
+    // binding(1) var<uniform> _mouse: Mouse { pos, click }
+    let perframe_bind_group_layout =
+        device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Bind Group Layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
                 },
-                count: None,
-            },
-            wgpu::BindGroupLayoutEntry {
-                binding: 1,
-                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
                 },
-                count: None,
-            },
-            wgpu::BindGroupLayoutEntry {
-                binding: 2,
-                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
+            ],
+        });
+
+    // group(1)
+    // binding(0) var _channel0: texture_2d<f32>
+    // binding(1) var _channel1: textute_2s<f32>
+    let texture_bind_group_layout =
+        device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Texture Bind Group Layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
                 },
-                count: None,
-            },
-        ],
-    });
-
-    // binding(0) iResolution
-    let info_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-        label: Some("Static Information Bind Group Layout"),
-        entries: &[wgpu::BindGroupLayoutEntry {
-            binding: 0,
-            visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
-            ty: wgpu::BindingType::Buffer {
-                ty: wgpu::BufferBindingType::Uniform,
-                has_dynamic_offset: false,
-                min_binding_size: None,
-            },
-            count: None,
-        }],
-    });
-
-    // binging(0) iMouse
-    let input_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-        label: Some("Input Bind Group Layout"),
-        entries: &[wgpu::BindGroupLayoutEntry {
-            binding: 0,
-            visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
-            ty: wgpu::BindingType::Buffer {
-                ty: wgpu::BufferBindingType::Uniform,
-                has_dynamic_offset: false,
-                min_binding_size: None,
-            },
-            count: None,
-        }],
-    });
-
-    // binding(0) iDate
-    let date_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-        label: Some("Date Bind Group Layout"),
-        entries: &[wgpu::BindGroupLayoutEntry {
-            binding: 0,
-            visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
-            ty: wgpu::BindingType::Buffer {
-                ty: wgpu::BufferBindingType::Uniform,
-                has_dynamic_offset: false,
-                min_binding_size: None,
-            },
-            count: None,
-        }],
-    });
-
-    // binding(0) iChannel
-    // binding(1) iSampler
-    let channel_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-        label: Some("Channels Bind Group Layout"),
-        entries: &[
-            wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Texture {
-                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                    view_dimension: wgpu::TextureViewDimension::D2,
-                    multisampled: false,
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
                 },
-                count: None,
-            },
-            wgpu::BindGroupLayoutEntry {
-                binding: 1,
-                visibility: wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                count: None,
-            },
-        ],
-    });
+            ],
+        });
+
+    // group(2)
+    // binding(0) var _nearest: sampler;
+    // binding(1) var _nearest_repeat: sampler;
+    // binding(2) var _bilinear: sampler;
+    // binding(3) var _bilinear_repeat: sampler;
+    let sampler_bind_group_layout =
+        device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Sampler Bind Group Layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::NonFiltering),
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::NonFiltering),
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
 
     let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("Render Pipline Layout"),
         bind_group_layouts: &[
-            // &perframe_layout,
-            // &info_layout,
-            //&input_layout,
-            //&date_layout,
-            //&channel_layout,
+            &perframe_bind_group_layout,
+            &texture_bind_group_layout,
+            &sampler_bind_group_layout,
         ],
         push_constant_ranges: &[],
     });
 
-    layout
+    (
+        layout,
+        perframe_bind_group_layout,
+        texture_bind_group_layout,
+        sampler_bind_group_layout,
+    )
 }
 
-pub fn initialize_perframe_buffers(
+#[repr(C)]
+#[derive(Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+struct TimeUniform {
+    frame: u32,
+    elapsed: f32,
+    delta: f32,
+}
+
+#[repr(C)]
+#[derive(Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+struct MouseUniform {
+    pos: [u32; 2],
+    click: i32,
+}
+
+pub fn initialize_bind_group_perframe(
     device: &wgpu::Device,
     layout: &wgpu::BindGroupLayout,
-) -> (wgpu::BindGroup, wgpu::Buffer, wgpu::Buffer, wgpu::Buffer) {
+) -> (wgpu::BindGroup, wgpu::Buffer, wgpu::Buffer) {
+    // binding(0) var<uniform> _time: Time { frame, elapsed }
+    // binding(1) var<uniform> _mouse: Mouse { pos, click }
+
     let time_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("iTime Buffer"),
-        size: std::mem::size_of::<f32>() as u64,
+        label: Some("_time Buffer"),
+        size: mem::size_of::<TimeUniform>() as wgpu::BufferAddress,
         usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
 
-    let timedelta_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("iTimeDelta Buffer"),
-        size: std::mem::size_of::<f32>() as u64,
-        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
-
-    let frame_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("iFrame Buffer"),
-        size: std::mem::size_of::<f32>() as u64,
+    let mouse_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("_mouse Buffer"),
+        size: mem::size_of::<MouseUniform>() as wgpu::BufferAddress,
         usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
@@ -409,86 +451,200 @@ pub fn initialize_perframe_buffers(
             },
             wgpu::BindGroupEntry {
                 binding: 1,
-                resource: timedelta_buffer.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 2,
-                resource: frame_buffer.as_entire_binding(),
+                resource: mouse_buffer.as_entire_binding(),
             },
         ],
     });
 
-    (bind_group, time_buffer, timedelta_buffer, frame_buffer)
+    (bind_group, time_buffer, mouse_buffer)
 }
 
-pub fn initialize_info_buffers(
+pub fn initialize_bind_group_texture(
     device: &wgpu::Device,
     layout: &wgpu::BindGroupLayout,
-) -> (wgpu::BindGroup, wgpu::Buffer) {
-    let resolution_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("iResolution Buffer"),
-        size: std::mem::size_of::<[i32; 3]>() as u64,
-        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
+) -> (
+    wgpu::BindGroup,
+    wgpu::Texture,
+    wgpu::TextureView,
+    wgpu::Texture,
+    wgpu::TextureView,
+) {
+    // binding(0) var _channel0: texture_2d<f32>
+    // binding(1) var _channel1: textute_2s<f32>
+
+    let channel0_texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("_channel0 Default Texture"),
+        size: wgpu::Extent3d {
+            width: 1024,
+            height: 1024,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::R8Unorm,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+
+    let channel1_texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("_channel0 Default Texture"),
+        size: wgpu::Extent3d {
+            width: 1024,
+            height: 1024,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::R8Unorm,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+
+    let view0 = channel0_texture.create_view(&wgpu::TextureViewDescriptor::default());
+    let view1 = channel1_texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("Per-frame Information Bind Group"),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(&view0),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::TextureView(&view1),
+            },
+        ],
+    });
+
+    (bind_group, channel0_texture, view0, channel1_texture, view1)
+}
+
+pub fn initialize_bind_group_sampler(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+) -> wgpu::BindGroup {
+    // binding(0) var _nearest: sampler;
+    // binding(1) var _nearest_repeat: sampler;
+    // binding(2) var _bilinear: sampler;
+    // binding(3) var _bilinear_repeat: sampler;
+    let nearest_sample = device.create_sampler(&wgpu::SamplerDescriptor {
+        label: Some("_nearest Sampler"),
+        address_mode_u: wgpu::AddressMode::ClampToEdge,
+        address_mode_v: wgpu::AddressMode::ClampToEdge,
+        address_mode_w: wgpu::AddressMode::ClampToEdge,
+        mag_filter: wgpu::FilterMode::Nearest,
+        min_filter: wgpu::FilterMode::Nearest,
+        mipmap_filter: wgpu::FilterMode::Nearest,
+        ..Default::default()
+    });
+
+    let bilinear_sample = device.create_sampler(&wgpu::SamplerDescriptor {
+        label: Some("_nearest Sampler"),
+        address_mode_u: wgpu::AddressMode::ClampToEdge,
+        address_mode_v: wgpu::AddressMode::ClampToEdge,
+        address_mode_w: wgpu::AddressMode::ClampToEdge,
+        mag_filter: wgpu::FilterMode::Linear,
+        min_filter: wgpu::FilterMode::Linear,
+        mipmap_filter: wgpu::FilterMode::Linear,
+        ..Default::default()
+    });
+
+    let nearest_repeat_sample = device.create_sampler(&wgpu::SamplerDescriptor {
+        label: Some("_nearest Sampler"),
+        address_mode_u: wgpu::AddressMode::Repeat,
+        address_mode_v: wgpu::AddressMode::Repeat,
+        address_mode_w: wgpu::AddressMode::Repeat,
+        mag_filter: wgpu::FilterMode::Nearest,
+        min_filter: wgpu::FilterMode::Nearest,
+        mipmap_filter: wgpu::FilterMode::Nearest,
+        ..Default::default()
+    });
+
+    let bilinear_repeat_sample = device.create_sampler(&wgpu::SamplerDescriptor {
+        label: Some("_nearest Sampler"),
+        address_mode_u: wgpu::AddressMode::Repeat,
+        address_mode_v: wgpu::AddressMode::Repeat,
+        address_mode_w: wgpu::AddressMode::Repeat,
+        mag_filter: wgpu::FilterMode::Linear,
+        min_filter: wgpu::FilterMode::Linear,
+        mipmap_filter: wgpu::FilterMode::Linear,
+        ..Default::default()
     });
 
     let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("Static Information Bind Group"),
+        label: Some("Per-frame Information Bind Group"),
         layout,
-        entries: &[wgpu::BindGroupEntry {
-            binding: 0,
-            resource: resolution_buffer.as_entire_binding(),
-        }],
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::Sampler(&nearest_sample),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::Sampler(&bilinear_sample),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: wgpu::BindingResource::Sampler(&nearest_repeat_sample),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: wgpu::BindingResource::Sampler(&bilinear_repeat_sample),
+            },
+        ],
     });
 
-    (bind_group, resolution_buffer)
+    bind_group
 }
 
-pub fn initialize_input_buffers(
+enum ChannelNo {
+    C0 = 0,
+    C1 = 1,
+}
+
+pub async fn load_image(
     device: &wgpu::Device,
+    queue: &wgpu::Queue,
     layout: &wgpu::BindGroupLayout,
-) -> (wgpu::BindGroup, wgpu::Buffer) {
-    let mouse_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("iMouse Buffer"),
-        size: std::mem::size_of::<[f32; 4]>() as u64,
-        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
+    channel: ChannelNo,
+    url: &str,
+) -> anyhow::Result<wgpu::BindGroup> {
+    let (texture_desc, texture_image, size) = res::load_texture_from_url(None, url).await?;
 
-    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("Input Bind Group"),
-        layout,
+    let texture = device.create_texture(&texture_desc);
+
+    queue.write_texture(
+        wgpu::ImageCopyTexture {
+            aspect: wgpu::TextureAspect::All,
+            texture: &texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+        },
+        &texture_image,
+        wgpu::ImageDataLayout {
+            offset: 0,
+            bytes_per_row: Some(4 * size.width),
+            rows_per_image: Some(size.height),
+        },
+        size,
+    );
+
+    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+    let channel_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        layout: &layout,
+        label: None,
         entries: &[wgpu::BindGroupEntry {
-            binding: 0,
-            resource: mouse_buffer.as_entire_binding(),
+            binding: channel as u32,
+            resource: wgpu::BindingResource::TextureView(&view),
         }],
     });
 
-    (bind_group, mouse_buffer)
+    anyhow::Ok(channel_bind_group)
 }
 
-pub fn initialize_date_buffers(
-    device: &wgpu::Device,
-    layout: &wgpu::BindGroupLayout,
-) -> (wgpu::BindGroup, wgpu::Buffer) {
-    let date_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("iDate Buffer"),
-        size: std::mem::size_of::<[f32; 4]>() as u64,
-        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
-
-    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("Date Bind Group"),
-        layout,
-        entries: &[wgpu::BindGroupEntry {
-            binding: 0,
-            resource: date_buffer.as_entire_binding(),
-        }],
-    });
-
-    (bind_group, date_buffer)
-}
-
-#[wasm_bindgen]
 pub fn on_canvas_resize() {}
