@@ -2,13 +2,21 @@ mod logger;
 mod res;
 mod utils;
 
-use std::mem;
+use std::{mem, thread};
 
 use wasm_bindgen::prelude::wasm_bindgen;
+
+const CLEAR_COLOR: wgpu::Color = wgpu::Color {
+    r: 0.1,
+    g: 0.2,
+    b: 0.3,
+    a: 1.0,
+};
 
 #[wasm_bindgen]
 pub async fn run() {
     logger::init_logger();
+    utils::set_panic_hook();
 
     let canvas_list = initialize_canvas();
 
@@ -19,14 +27,125 @@ pub async fn run() {
 
     let mut context_list: Vec<Context> = vec![];
     for canvas in canvas_list {
-        let context = initialize_context(canvas).await;
+        let context = Context::new(canvas).await;
         context_list.push(context);
     }
 
-    let shader_desc = wgpu::ShaderModuleDescriptor {
-        label: None,
-        source: wgpu::ShaderSource::Wgsl(
-            r##"
+    let time_begin = web_time::Instant::now();
+    let frame: u32 = 0;
+    loop {
+        let time_frame_begin = web_time::Instant::now();
+
+        for context in &context_list {
+            context.input();
+            context.update();
+        }
+
+        // rendering
+        for context in &context_list {
+            match context.render() {
+                Ok(_) => {
+                    log::info!("rendering");
+                }
+                Err(wgpu::SurfaceError::Lost) => context.resize(),
+                Err(e) => log::error!("{:?}", e),
+            };
+        }
+
+        let time_delta = time_frame_begin.elapsed().as_secs_f32();
+
+        let target_fps = 60f32;
+        let expected_delta = 1f32 / target_fps;
+
+        let delay = expected_delta - time_delta;
+        if delay > 0f32 {
+            thread::sleep(web_time::Duration::from_secs_f32(delay));
+        }
+
+        let time_elapsed = time_begin.elapsed().as_secs_f32();
+        context_list.iter_mut().for_each(|context| {
+            context.time_uniform = TimeUniform {
+                frame,
+                elapsed: time_elapsed,
+                delta: time_delta.max(expected_delta),
+            };
+        });
+    }
+}
+
+struct Context<'canvas> {
+    canvas: web_sys::HtmlCanvasElement,
+    instance: wgpu::Instance,
+    surface: wgpu::Surface<'canvas>,
+    adapter: wgpu::Adapter,
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+    config: wgpu::SurfaceConfiguration,
+    render_pipeline: wgpu::RenderPipeline,
+    pipeline_layout: wgpu::PipelineLayout,
+    perframe_bind_group: wgpu::BindGroup,
+    texture_bind_group: wgpu::BindGroup,
+    sampler_bind_group: wgpu::BindGroup,
+    time_buffer: wgpu::Buffer,
+    mouse_buffer: wgpu::Buffer,
+    texture_bindgroup_layout: wgpu::BindGroupLayout,
+    channel0_texture: wgpu::Texture,
+    channel1_texture: wgpu::Texture,
+    channel0_view: wgpu::TextureView,
+    channel1_view: wgpu::TextureView,
+    time_uniform: TimeUniform,
+    mouse_uniform: MouseUniform,
+}
+
+impl Context<'_> {
+    async fn new(canvas: web_sys::HtmlCanvasElement) -> Self {
+        let (canvas, instance, surface, adapter, device, queue, config) = {
+            let (width, height) = (canvas.width(), canvas.height());
+
+            let instance = initialize_instance();
+
+            let surface_target = wgpu::SurfaceTarget::Canvas(canvas.clone());
+            let surface = instance
+                .create_surface(surface_target)
+                .expect("Could not create surface from canvas");
+
+            log::info!("Surface info: {:#?}", surface);
+
+            let adapter = instance
+                .request_adapter(&wgpu::RequestAdapterOptions {
+                    compatible_surface: Some(&surface),
+                    ..wgpu::RequestAdapterOptions::default()
+                })
+                .await
+                .expect("Could not get adapter");
+
+            log::info!("Adapter info: {:#?}", adapter.get_info());
+
+            let (device, queue) = initialize_device(&adapter).await;
+
+            log::info!("Device info: {:#?}", device);
+            log::info!("Queue info: {:#?}", adapter);
+
+            let config = surface
+                .get_default_config(&adapter, width, height)
+                .expect("Surface isn't supported by the adapter.");
+
+            let surface_formats = surface.get_capabilities(&adapter).formats;
+            log::info!("Support texture formats: {:#?}", surface_formats);
+
+            log::info!("Surface configuration info: {:#?}", config);
+
+            (canvas, instance, surface, adapter, device, queue, config)
+        };
+
+        surface.configure(&device, &config);
+
+        // setup
+
+        let shader_desc = wgpu::ShaderModuleDescriptor {
+            label: None,
+            source: wgpu::ShaderSource::Wgsl(
+                r##"
 struct VertexOutput {
     @builtin(position) clip_position: vec4<f32>,
     @location(0) position: vec2<f32>,
@@ -50,80 +169,175 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 }
 
 "##
-            .into(),
-        ),
-    };
+                .into(),
+            ),
+        };
 
-    let mut idx = 0;
-
-    for context in context_list {
-        let (layout, perframe_layout, texture_layout, sampler_layout) =
-            initialize_pipeline_layout(&context.device);
+        let (pipeline_layout, perframe_layout, texture_layout, sampler_layout) =
+            initialize_pipeline_layout(&device);
         let (perframe_bind_group, time_buffer, mouse_buffer) =
-            initialize_bind_group_perframe(&context.device, &perframe_layout);
-        let (texture_bind_group, channel0, view0, channel1, view1) =
-            initialize_bind_group_texture(&context.device, &texture_layout);
-        let sampler_bind_group = initialize_bind_group_sampler(&context.device, &sampler_layout);
+            initialize_bind_group_perframe(&device, &perframe_layout);
+        let (texture_bind_group, channel0_texture, channel0_view, channel1_texture, channel1_view) =
+            initialize_bind_group_texture(&device, &texture_layout);
+        let sampler_bind_group = initialize_bind_group_sampler(&device, &sampler_layout);
 
-        let shader = context.device.create_shader_module(shader_desc.clone());
-        let render_pipeline =
-            context
-                .device
-                .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                    label: Some("Render Pipeline"),
-                    layout: Some(&layout),
-                    vertex: wgpu::VertexState {
-                        module: &shader,
-                        entry_point: "vs_main",
-                        buffers: &[],
-                    },
-                    fragment: Some(wgpu::FragmentState {
-                        module: &shader,
-                        entry_point: "fs_main",
-                        targets: &[Some(wgpu::ColorTargetState {
-                            format: context.config.format,
-                            blend: Some(wgpu::BlendState::REPLACE),
-                            write_mask: wgpu::ColorWrites::ALL,
-                        })],
-                    }),
-                    primitive: wgpu::PrimitiveState {
-                        topology: wgpu::PrimitiveTopology::TriangleList,
-                        strip_index_format: None,
-                        front_face: wgpu::FrontFace::Ccw,
-                        cull_mode: Some(wgpu::Face::Back),
-                        unclipped_depth: false,
-                        polygon_mode: wgpu::PolygonMode::Fill,
-                        conservative: false,
-                    },
-                    depth_stencil: None,
-                    multisample: wgpu::MultisampleState {
-                        count: 1,
-                        mask: !0,
-                        alpha_to_coverage_enabled: false,
-                    },
-                    multiview: None,
-                });
+        let shader = device.create_shader_module(shader_desc.clone());
+        let render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Render Pipeline"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: "vs_main",
+                buffers: &[],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: "fs_main",
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: config.format,
+                    blend: Some(wgpu::BlendState::REPLACE),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: Some(wgpu::Face::Back),
+                unclipped_depth: false,
+                polygon_mode: wgpu::PolygonMode::Fill,
+                conservative: false,
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState {
+                count: 1,
+                mask: !0,
+                alpha_to_coverage_enabled: false,
+            },
+            multiview: None,
+        });
 
-        // render
+        let time_uniform = TimeUniform {
+            frame: 1,
+            elapsed: 0.0,
+            delta: 0.0,
+        };
 
-        let output = context.surface.get_current_texture().unwrap();
+        let mouse_uniform = MouseUniform {
+            pos: [0, 0],
+            click: 0,
+        };
+
+        Context {
+            canvas,
+            instance,
+            surface,
+            adapter,
+            device,
+            queue,
+            config,
+            render_pipeline,
+            pipeline_layout,
+            perframe_bind_group,
+            texture_bind_group,
+            sampler_bind_group,
+            time_buffer,
+            mouse_buffer,
+            texture_bindgroup_layout: texture_layout,
+            channel0_texture,
+            channel1_texture,
+            channel0_view,
+            channel1_view,
+            time_uniform,
+            mouse_uniform,
+        }
+    }
+
+    fn config_shader(&mut self, shader: &str) {
+        let shader_desc = wgpu::ShaderModuleDescriptor {
+            label: None,
+            source: wgpu::ShaderSource::Wgsl(shader.into()),
+        };
+
+        let shader = self.device.create_shader_module(shader_desc.clone());
+
+        let render_pipeline = self
+            .device
+            .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("Render Pipeline"),
+                layout: Some(&self.pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: "vs_main",
+                    buffers: &[],
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: "fs_main",
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: self.config.format,
+                        blend: Some(wgpu::BlendState::REPLACE),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    strip_index_format: None,
+                    front_face: wgpu::FrontFace::Ccw,
+                    cull_mode: Some(wgpu::Face::Back),
+                    unclipped_depth: false,
+                    polygon_mode: wgpu::PolygonMode::Fill,
+                    conservative: false,
+                },
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState {
+                    count: 1,
+                    mask: !0,
+                    alpha_to_coverage_enabled: false,
+                },
+                multiview: None,
+            });
+
+        self.render_pipeline = render_pipeline;
+
+        // todo: reload
+    }
+
+    async fn config_texture(&mut self, channel: ChannelNo, url: &str) -> anyhow::Result<()> {
+        let bind_group = load_image(
+            &self.device,
+            &self.queue,
+            &self.texture_bindgroup_layout,
+            channel,
+            url,
+        )
+        .await?;
+
+        self.texture_bind_group = bind_group;
+
+        // todo: reload
+
+        Ok(())
+    }
+
+    fn resize(&self) {}
+
+    fn input(&self) {}
+
+    fn update(&self) {}
+
+    fn render(&self) -> Result<(), wgpu::SurfaceError> {
+        let output = self.surface.get_current_texture().unwrap();
         let view = output
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
-        let mut encoder = context
+        let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("Render Encoder"),
             });
         {
-            static CLEAR_COLOR: wgpu::Color = wgpu::Color {
-                r: 0.1,
-                g: 0.2,
-                b: 0.3,
-                a: 1.0,
-            };
-
-            let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Render Pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &view,
@@ -149,27 +363,27 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
                 click: 0,
             };
 
-            context
-                .queue
-                .write_buffer(&time_buffer, 0, bytemuck::cast_slice(&[time_uniform]));
+            self.queue
+                .write_buffer(&self.time_buffer, 0, bytemuck::cast_slice(&[time_uniform]));
 
-            context
-                .queue
-                .write_buffer(&mouse_buffer, 0, bytemuck::cast_slice(&[mouse_uniform]));
+            self.queue.write_buffer(
+                &self.mouse_buffer,
+                0,
+                bytemuck::cast_slice(&[mouse_uniform]),
+            );
 
-            render_pass.set_pipeline(&render_pipeline);
-            render_pass.set_bind_group(0, &perframe_bind_group, &[]);
-            render_pass.set_bind_group(1, &texture_bind_group, &[]);
-            render_pass.set_bind_group(2, &sampler_bind_group, &[]);
-            render_pass.draw((0 + idx)..(3 + idx), 0..1);
-            log::info!("Triangle: {:#?} {:#?} ", (0 + idx), (3 + idx));
-
-            idx += 1;
+            pass.set_pipeline(&self.render_pipeline);
+            pass.set_bind_group(0, &self.perframe_bind_group, &[]);
+            pass.set_bind_group(1, &self.texture_bind_group, &[]);
+            pass.set_bind_group(2, &self.sampler_bind_group, &[]);
+            pass.draw(0..3, 0..1);
         }
 
         // submit will accept anything that implements IntoIter
-        context.queue.submit(std::iter::once(encoder.finish()));
+        self.queue.submit(std::iter::once(encoder.finish()));
         output.present();
+
+        Ok(())
     }
 }
 
@@ -192,69 +406,6 @@ pub fn initialize_canvas() -> Vec<web_sys::HtmlCanvasElement> {
             Some(canvas_list)
         })
         .unwrap()
-}
-
-struct Context<'canvas> {
-    canvas: web_sys::HtmlCanvasElement,
-    instance: wgpu::Instance,
-    surface: wgpu::Surface<'canvas>,
-    adapter: wgpu::Adapter,
-    device: wgpu::Device,
-    queue: wgpu::Queue,
-    config: wgpu::SurfaceConfiguration,
-}
-
-async fn initialize_context(canvas: web_sys::HtmlCanvasElement) -> Context<'static> {
-    let (canvas, instance, surface, adapter, device, queue, config) = {
-        let (width, height) = (canvas.width(), canvas.height());
-
-        let instance = initialize_instance();
-
-        let surface_target = wgpu::SurfaceTarget::Canvas(canvas.clone());
-        let surface = instance
-            .create_surface(surface_target)
-            .expect("Could not create surface from canvas");
-
-        log::info!("Surface info: {:#?}", surface);
-
-        let adapter = instance
-            .request_adapter(&wgpu::RequestAdapterOptions {
-                compatible_surface: Some(&surface),
-                ..wgpu::RequestAdapterOptions::default()
-            })
-            .await
-            .expect("Could not get adapter");
-
-        log::info!("Adapter info: {:#?}", adapter.get_info());
-
-        let (device, queue) = initialize_device(&adapter).await;
-
-        log::info!("Device info: {:#?}", device);
-        log::info!("Queue info: {:#?}", adapter);
-
-        let config = surface
-            .get_default_config(&adapter, width, height)
-            .expect("Surface isn't supported by the adapter.");
-
-        let surface_formats = surface.get_capabilities(&adapter).formats;
-        log::info!("Support texture formats: {:#?}", surface_formats);
-
-        log::info!("Surface configuration info: {:#?}", config);
-
-        (canvas, instance, surface, adapter, device, queue, config)
-    };
-
-    surface.configure(&device, &config);
-
-    Context {
-        canvas,
-        instance,
-        surface,
-        adapter,
-        device,
-        queue,
-        config,
-    }
 }
 
 pub fn initialize_instance() -> wgpu::Instance {
