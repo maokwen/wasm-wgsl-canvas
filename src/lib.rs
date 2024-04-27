@@ -8,6 +8,8 @@ use std::rc::Rc;
 use std::mem;
 use wasm_bindgen::prelude::wasm_bindgen;
 
+const TARGET_FPS: i32 = 60;
+
 const CLEAR_COLOR: wgpu::Color = wgpu::Color {
     r: 0.1,
     g: 0.2,
@@ -33,14 +35,11 @@ pub async fn run() -> Result<(), wasm_bindgen::JsValue> {
         context_list.push(context);
     }
 
-    let callback_f = Rc::new(RefCell::new(None));
-    let callback_g = callback_f.clone();
-
     let time_begin = web_time::Instant::now();
-    let frame: u32 = 0;
+    let mut frame: u32 = 0;
+    let mut time_last = web_time::Instant::now();
 
-    *callback_g.borrow_mut() = Some(wasm_bindgen::closure::Closure::new(move || {
-        let time_frame_begin = web_time::Instant::now();
+    let mut draw_frame = move || {
         for context in &context_list {
             context.input();
             context.update();
@@ -49,40 +48,51 @@ pub async fn run() -> Result<(), wasm_bindgen::JsValue> {
         // rendering
         for context in &context_list {
             match context.render() {
-                Ok(_) => {
-                    log::info!("rendering");
-                }
+                Ok(_) => {}
                 Err(wgpu::SurfaceError::Lost) => context.resize(),
                 Err(e) => log::error!("{:?}", e),
             };
         }
 
-        let time_delta = time_frame_begin.elapsed().as_secs_f32();
-
-        let target_fps = 60f32;
-        let expected_delta = 1f32 / target_fps;
+        let time_delta = time_last.elapsed().as_secs_f32();
+        time_last = web_time::Instant::now();
 
         let time_elapsed = time_begin.elapsed().as_secs_f32();
         context_list.iter_mut().for_each(|context| {
             context.time_uniform = TimeUniform {
                 frame,
                 elapsed: time_elapsed,
-                delta: time_delta.max(expected_delta),
+                delta: time_delta,
             };
         });
-        // let extra_timeout = ((expected_delta - time_delta) * 1000f32) as i32;
-        // if extra_timeout > 10 {
-        //     set_timeout(
-        //         window(),
-        //         callback_f.borrow().as_ref().unwrap(),
-        //         extra_timeout,
-        //     );
-        // }
 
-        request_animation_frame(window(), callback_f.borrow().as_ref().unwrap());
+        frame += 1;
+    };
+
+    // callbacks for request_animation_frame
+    let animate_f = Rc::new(RefCell::new(None));
+    let animate_g = animate_f.clone();
+
+    // callbacks for set_timeout
+    let timeout_f = Rc::new(RefCell::new(None));
+    let timeout_g = timeout_f.clone();
+
+    *timeout_g.borrow_mut() = Some(wasm_bindgen::closure::Closure::new(move || {
+        request_animation_frame(window(), animate_f.borrow().as_ref().unwrap());
     }));
 
-    request_animation_frame(window(), callback_g.borrow().as_ref().unwrap());
+    *animate_g.borrow_mut() = Some(wasm_bindgen::closure::Closure::new(move || {
+        draw_frame();
+        let extra_timeout = 1000 / TARGET_FPS;
+
+        set_timeout(
+            window(),
+            timeout_f.borrow().as_ref().unwrap(),
+            extra_timeout,
+        );
+    }));
+
+    request_animation_frame(window(), timeout_g.borrow().as_ref().unwrap());
     Ok(())
 }
 
