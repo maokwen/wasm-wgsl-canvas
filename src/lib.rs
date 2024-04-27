@@ -2,8 +2,10 @@ mod logger;
 mod res;
 mod utils;
 
-use std::{mem, thread};
+use std::cell::RefCell;
+use std::rc::Rc;
 
+use std::mem;
 use wasm_bindgen::prelude::wasm_bindgen;
 
 const CLEAR_COLOR: wgpu::Color = wgpu::Color {
@@ -14,7 +16,7 @@ const CLEAR_COLOR: wgpu::Color = wgpu::Color {
 };
 
 #[wasm_bindgen]
-pub async fn run() {
+pub async fn run() -> Result<(), wasm_bindgen::JsValue> {
     logger::init_logger();
     utils::set_panic_hook();
 
@@ -22,7 +24,7 @@ pub async fn run() {
 
     if canvas_list.is_empty() {
         log::info!("No canvas found");
-        return;
+        return Ok(());
     }
 
     let mut context_list: Vec<Context> = vec![];
@@ -31,11 +33,14 @@ pub async fn run() {
         context_list.push(context);
     }
 
+    let callback_f = Rc::new(RefCell::new(None));
+    let callback_g = callback_f.clone();
+
     let time_begin = web_time::Instant::now();
     let frame: u32 = 0;
-    loop {
-        let time_frame_begin = web_time::Instant::now();
 
+    *callback_g.borrow_mut() = Some(wasm_bindgen::closure::Closure::new(move || {
+        let time_frame_begin = web_time::Instant::now();
         for context in &context_list {
             context.input();
             context.update();
@@ -57,11 +62,6 @@ pub async fn run() {
         let target_fps = 60f32;
         let expected_delta = 1f32 / target_fps;
 
-        let delay = expected_delta - time_delta;
-        if delay > 0f32 {
-            thread::sleep(web_time::Duration::from_secs_f32(delay));
-        }
-
         let time_elapsed = time_begin.elapsed().as_secs_f32();
         context_list.iter_mut().for_each(|context| {
             context.time_uniform = TimeUniform {
@@ -70,9 +70,47 @@ pub async fn run() {
                 delta: time_delta.max(expected_delta),
             };
         });
-    }
+        // let extra_timeout = ((expected_delta - time_delta) * 1000f32) as i32;
+        // if extra_timeout > 10 {
+        //     set_timeout(
+        //         window(),
+        //         callback_f.borrow().as_ref().unwrap(),
+        //         extra_timeout,
+        //     );
+        // }
+
+        request_animation_frame(window(), callback_f.borrow().as_ref().unwrap());
+    }));
+
+    request_animation_frame(window(), callback_g.borrow().as_ref().unwrap());
+    Ok(())
 }
 
+fn window() -> web_sys::Window {
+    web_sys::window().expect("no global `window` exists")
+}
+
+fn set_timeout(
+    window: web_sys::Window,
+    callback: &wasm_bindgen::closure::Closure<dyn FnMut()>,
+    timeout: i32,
+) {
+    use wasm_bindgen::JsCast;
+    window.set_timeout_with_callback_and_timeout_and_arguments_0(
+        callback.as_ref().unchecked_ref(),
+        timeout,
+    );
+}
+
+fn request_animation_frame(
+    window: web_sys::Window,
+    callback: &wasm_bindgen::closure::Closure<dyn FnMut()>,
+) {
+    use wasm_bindgen::JsCast;
+    window
+        .request_animation_frame(callback.as_ref().unchecked_ref())
+        .expect("should register `requestAnimationFrame` OK");
+}
 struct Context<'canvas> {
     canvas: web_sys::HtmlCanvasElement,
     instance: wgpu::Instance,
