@@ -199,6 +199,11 @@ struct VertexOutput {
     @location(0) position: vec2<f32>,
 };
 
+struct Time { frame: u32, elapsed: f32, delta: f32 }
+
+@group(0) @binding(0)
+var<uniform> _time: Time;
+
 @vertex
 fn vs_main(
     @builtin(vertex_index) in_vertex_index: u32,
@@ -206,8 +211,13 @@ fn vs_main(
     var out: VertexOutput;
     let x = f32(1 - i32(in_vertex_index)) * 0.5;
     let y = f32(i32(in_vertex_index & 1u) * 2 - 1) * 0.5;
+
+    let elapsed = _time.elapsed;
+    let rx = (cos(elapsed) * x) - (sin(elapsed) * y);
+    let ry = (cos(elapsed) * y) + (sin(elapsed) * x);
+    
     out.clip_position = vec4<f32>(x, y, 0.0, 1.0);
-    out.position = vec2<f32>(x, y);
+    out.position = vec2<f32>(rx, ry);
     return out;
 }             
 
@@ -400,24 +410,16 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
                 timestamp_writes: None,
             });
 
-            let time_uniform = TimeUniform {
-                frame: 1,
-                elapsed: 1.0,
-                delta: 1.0,
-            };
-
-            let mouse_uniform = MouseUniform {
-                pos: [0, 0],
-                click: 0,
-            };
-
-            self.queue
-                .write_buffer(&self.time_buffer, 0, bytemuck::cast_slice(&[time_uniform]));
+            self.queue.write_buffer(
+                &self.time_buffer,
+                0,
+                bytemuck::cast_slice(&[self.time_uniform]),
+            );
 
             self.queue.write_buffer(
                 &self.mouse_buffer,
                 0,
-                bytemuck::cast_slice(&[mouse_uniform]),
+                bytemuck::cast_slice(&[self.mouse_uniform]),
             );
 
             pass.set_pipeline(&self.render_pipeline);
