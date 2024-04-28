@@ -6,7 +6,9 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use std::mem;
+use wasm_bindgen::closure::Closure;
 use wasm_bindgen::prelude::wasm_bindgen;
+use wasm_bindgen::JsCast;
 
 const TARGET_FPS: i32 = 60;
 
@@ -30,6 +32,7 @@ pub async fn run() -> Result<(), wasm_bindgen::JsValue> {
     }
 
     let mut context_list: Vec<Context> = vec![];
+
     for canvas in canvas_list {
         let context = Context::new(canvas).await;
         context_list.push(context);
@@ -46,10 +49,10 @@ pub async fn run() -> Result<(), wasm_bindgen::JsValue> {
         }
 
         // rendering
-        for context in &context_list {
+        for context in &mut context_list {
             match context.render() {
                 Ok(_) => {}
-                Err(wgpu::SurfaceError::Lost) => context.resize(),
+                // Err(wgpu::SurfaceError::Outdated) => context.resize(),
                 Err(e) => log::error!("{:?}", e),
             };
         }
@@ -77,11 +80,11 @@ pub async fn run() -> Result<(), wasm_bindgen::JsValue> {
     let timeout_f = Rc::new(RefCell::new(None));
     let timeout_g = timeout_f.clone();
 
-    *timeout_g.borrow_mut() = Some(wasm_bindgen::closure::Closure::new(move || {
+    *timeout_g.borrow_mut() = Some(Closure::new(move || {
         request_animation_frame(window(), animate_f.borrow().as_ref().unwrap());
     }));
 
-    *animate_g.borrow_mut() = Some(wasm_bindgen::closure::Closure::new(move || {
+    *animate_g.borrow_mut() = Some(Closure::new(move || {
         draw_frame();
         let extra_timeout = 1000 / TARGET_FPS;
 
@@ -100,23 +103,14 @@ fn window() -> web_sys::Window {
     web_sys::window().expect("no global `window` exists")
 }
 
-fn set_timeout(
-    window: web_sys::Window,
-    callback: &wasm_bindgen::closure::Closure<dyn FnMut()>,
-    timeout: i32,
-) {
-    use wasm_bindgen::JsCast;
+fn set_timeout(window: web_sys::Window, callback: &Closure<dyn FnMut()>, timeout: i32) {
     window.set_timeout_with_callback_and_timeout_and_arguments_0(
         callback.as_ref().unchecked_ref(),
         timeout,
     );
 }
 
-fn request_animation_frame(
-    window: web_sys::Window,
-    callback: &wasm_bindgen::closure::Closure<dyn FnMut()>,
-) {
-    use wasm_bindgen::JsCast;
+fn request_animation_frame(window: web_sys::Window, callback: &Closure<dyn FnMut()>) {
     window
         .request_animation_frame(callback.as_ref().unchecked_ref())
         .expect("should register `requestAnimationFrame` OK");
@@ -142,7 +136,7 @@ struct Context<'canvas> {
     channel0_view: wgpu::TextureView,
     channel1_view: wgpu::TextureView,
     time_uniform: TimeUniform,
-    mouse_uniform: MouseUniform,
+    mouse_uniform: Rc<RefCell<MouseUniform>>,
 }
 
 impl Context<'_> {
@@ -200,9 +194,10 @@ struct VertexOutput {
 };
 
 struct Time { frame: u32, elapsed: f32, delta: f32 }
+struct Mouse { pos: vec2<u32>, click: u32 }
 
-@group(0) @binding(0)
-var<uniform> _time: Time;
+@group(0) @binding(0)   var<uniform> _time: Time;
+@group(0) @binding(1)   var<uniform> _mouse: Mouse;
 
 @vertex
 fn vs_main(
@@ -213,8 +208,8 @@ fn vs_main(
     let y = f32(i32(in_vertex_index & 1u) * 2 - 1) * 0.5;
 
     let elapsed = _time.elapsed;
-    let rx = (cos(elapsed) * x) - (sin(elapsed) * y);
-    let ry = (cos(elapsed) * y) + (sin(elapsed) * x);
+    let rx = (cos(elapsed) * x) - (sin(elapsed) * y) + f32(_mouse.pos.x) / 1000.0;
+    let ry = (cos(elapsed) * y) + (sin(elapsed) * x) + f32(_mouse.pos.y) / 1000.0;
     
     out.clip_position = vec4<f32>(x, y, 0.0, 1.0);
     out.position = vec2<f32>(rx, ry);
@@ -281,10 +276,13 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             delta: 0.0,
         };
 
-        let mouse_uniform = MouseUniform {
+        let mouse_uniform = Rc::new(RefCell::new(MouseUniform {
             pos: [0, 0],
             click: 0,
-        };
+            _padding: 0,
+        }));
+
+        initialize_mouse_handler(&window(), mouse_uniform.clone());
 
         Context {
             canvas,
@@ -378,7 +376,16 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         Ok(())
     }
 
-    fn resize(&self) {}
+    fn resize(&mut self) {
+        log::info!("Resizing canvas");
+        let width = self.canvas.client_width() as u32;
+        let height = self.canvas.client_height() as u32;
+        self.canvas.set_width(width);
+        self.canvas.set_height(height);
+        self.config.width = width;
+        self.config.height = height;
+        self.surface.configure(&self.device, &self.config);
+    }
 
     fn input(&self) {}
 
@@ -416,11 +423,14 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
                 bytemuck::cast_slice(&[self.time_uniform]),
             );
 
-            self.queue.write_buffer(
-                &self.mouse_buffer,
-                0,
-                bytemuck::cast_slice(&[self.mouse_uniform]),
-            );
+            let mut mouse: MouseUniform = MouseUniform {
+                pos: [0, 0],
+                click: 0,
+                _padding: 0,
+            };
+            self.mouse_uniform.as_ref().borrow().clone_into(&mut mouse);
+            self.queue
+                .write_buffer(&self.mouse_buffer, 0, bytemuck::cast_slice(&[mouse]));
 
             pass.set_pipeline(&self.render_pipeline);
             pass.set_bind_group(0, &self.perframe_bind_group, &[]);
@@ -438,8 +448,6 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 }
 
 pub fn initialize_canvas() -> Vec<web_sys::HtmlCanvasElement> {
-    use wasm_bindgen::JsCast;
-
     let mut canvas_list: Vec<web_sys::HtmlCanvasElement> = vec![];
     web_sys::window()
         .and_then(|win| win.document())
@@ -451,6 +459,7 @@ pub fn initialize_canvas() -> Vec<web_sys::HtmlCanvasElement> {
                     .unwrap()
                     .dyn_into::<web_sys::HtmlCanvasElement>()
                     .expect("Failed to initialize canvas");
+
                 canvas_list.push(canvas);
             }
             Some(canvas_list)
@@ -618,7 +627,8 @@ struct TimeUniform {
 #[derive(Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
 struct MouseUniform {
     pos: [u32; 2],
-    click: i32,
+    click: u32,
+    _padding: u32, // in wgsl all fields will be aligned to 4, 8, 16 bytes
 }
 
 pub fn initialize_bind_group_perframe(
@@ -658,6 +668,29 @@ pub fn initialize_bind_group_perframe(
     });
 
     (bind_group, time_buffer, mouse_buffer)
+}
+
+fn initialize_mouse_handler(window: &web_sys::Window, mouse: Rc<RefCell<MouseUniform>>) {
+    let closure = Closure::wrap(Box::new(move |event: web_sys::MouseEvent| {
+        let mut mouse = mouse.borrow_mut();
+        mouse.pos[0] = event.client_x() as u32;
+        mouse.pos[1] = event.client_y() as u32;
+        mouse.click = event.buttons() as u32;
+    }) as Box<dyn FnMut(_)>);
+
+    window
+        .add_event_listener_with_callback("mousemove", closure.as_ref().unchecked_ref())
+        .unwrap();
+
+    window
+        .add_event_listener_with_callback("mousedown", closure.as_ref().unchecked_ref())
+        .unwrap();
+
+    window
+        .add_event_listener_with_callback("mouseup", closure.as_ref().unchecked_ref())
+        .unwrap();
+
+    closure.forget();
 }
 
 pub fn initialize_bind_group_texture(
