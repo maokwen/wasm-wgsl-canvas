@@ -242,6 +242,9 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
                 module: &shader,
                 entry_point: "vs_main",
                 buffers: &[],
+                compilation_options: wgpu::PipelineCompilationOptions {
+                    ..Default::default()
+                },
             },
             fragment: Some(wgpu::FragmentState {
                 module: &shader,
@@ -251,6 +254,9 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
                     blend: Some(wgpu::BlendState::REPLACE),
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
+                compilation_options: wgpu::PipelineCompilationOptions {
+                    ..Default::default()
+                },
             }),
             primitive: wgpu::PrimitiveState {
                 topology: wgpu::PrimitiveTopology::TriangleList,
@@ -326,6 +332,9 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
                     module: &shader,
                     entry_point: "vs_main",
                     buffers: &[],
+                    compilation_options: wgpu::PipelineCompilationOptions {
+                        ..Default::default()
+                    },
                 },
                 fragment: Some(wgpu::FragmentState {
                     module: &shader,
@@ -335,6 +344,9 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
                         blend: Some(wgpu::BlendState::REPLACE),
                         write_mask: wgpu::ColorWrites::ALL,
                     })],
+                    compilation_options: wgpu::PipelineCompilationOptions {
+                        ..Default::default()
+                    },
                 }),
                 primitive: wgpu::PrimitiveState {
                     topology: wgpu::PrimitiveTopology::TriangleList,
