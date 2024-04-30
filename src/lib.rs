@@ -4,6 +4,7 @@ mod utils;
 
 use std::cell::RefCell;
 use std::rc::Rc;
+use wasm_bindgen::JsValue;
 
 use std::mem;
 use wasm_bindgen::closure::Closure;
@@ -74,7 +75,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 "###;
 
 #[wasm_bindgen]
-pub async fn run() -> Result<(), wasm_bindgen::JsValue> {
+pub async fn run() -> Result<(), JsValue> {
     logger::init_logger();
     utils::set_panic_hook();
 
@@ -88,8 +89,10 @@ pub async fn run() -> Result<(), wasm_bindgen::JsValue> {
     let mut context_list: Vec<Context> = vec![];
 
     for canvas in canvas_list {
-        let context = Context::new(canvas).await;
-        context_list.push(context.expect("Failed to initialize context"));
+        let context = Context::new(canvas)
+            .await
+            .expect("Failed to initialize context");
+        context_list.push(context);
     }
 
     let time_begin = web_time::Instant::now();
@@ -97,7 +100,7 @@ pub async fn run() -> Result<(), wasm_bindgen::JsValue> {
     let mut time_last = web_time::Instant::now();
 
     let mut draw_frame = move || {
-        for context in &context_list {
+        for context in &mut context_list {
             context.input();
             context.update();
         }
@@ -194,6 +197,8 @@ struct Context<'canvas> {
     vertices: Vec<f32>,
     vertex_buffer: wgpu::Buffer,
     shader: wgpu::ShaderModule,
+    mutation_observer: web_sys::MutationObserver,
+    refresh_flag: Rc<RefCell<bool>>,
 }
 
 impl Context<'_> {
@@ -280,7 +285,11 @@ impl Context<'_> {
             _padding: 0,
         }));
 
+        let refresh_flag = Rc::new(RefCell::new(false));
+
         initialize_mouse_handler(&window(), mouse_uniform.clone());
+        let mutation_observer =
+            initialize_datachange_handler(&window(), &canvas, refresh_flag.clone());
 
         Ok(Context {
             canvas,
@@ -307,6 +316,8 @@ impl Context<'_> {
             vertices,
             vertex_buffer,
             shader,
+            mutation_observer,
+            refresh_flag,
         })
     }
 
@@ -364,26 +375,27 @@ impl Context<'_> {
         })
     }
 
-    fn config_data(&mut self) -> anyhow::Result<()> {
-        let (vertices, shader_vert, shader_frag) = get_canvas_data(&self.canvas)?;
+    fn config_data(&mut self) {
+        match get_canvas_data(&self.canvas) {
+            Ok((vertices, shader_vert, shader_frag)) => {
+                let shader_desc = wgpu::ShaderModuleDescriptor {
+                    label: None,
+                    source: wgpu::ShaderSource::Wgsl(
+                        format!("{SHADER_DEFINES}{shader_vert}{shader_frag}").into(),
+                    ),
+                };
 
-        let shader_desc = wgpu::ShaderModuleDescriptor {
-            label: None,
-            source: wgpu::ShaderSource::Wgsl(
-                format!("{SHADER_DEFINES}{shader_vert}{shader_frag}").into(),
-            ),
-        };
+                let shader = self.device.create_shader_module(shader_desc.clone());
 
-        let shader = self.device.create_shader_module(shader_desc.clone());
-
-        self.render_pipeline = Context::setup_pipeline(
-            &self.device,
-            &self.pipeline_layout,
-            self.config.format,
-            &shader,
-        );
-
-        Ok(())
+                self.render_pipeline = Context::setup_pipeline(
+                    &self.device,
+                    &self.pipeline_layout,
+                    self.config.format,
+                    &shader,
+                );
+            }
+            Err(e) => log::error!("Failed to get canvas data: {:?}", e),
+        }
     }
 
     async fn config_texture(&mut self, channel: ChannelNo, url: &str) -> anyhow::Result<()> {
@@ -414,7 +426,12 @@ impl Context<'_> {
 
     fn input(&self) {}
 
-    fn update(&self) {}
+    fn update(&mut self) {
+        if *self.refresh_flag.borrow() {
+            self.config_data();
+            self.refresh_flag.replace(false);
+        }
+    }
 
     fn render(&self) -> Result<(), wgpu::SurfaceError> {
         let output = self.surface.get_current_texture().unwrap();
@@ -710,19 +727,13 @@ fn initialize_mouse_handler(window: &web_sys::Window, mouse: Rc<RefCell<MouseUni
         mouse.click = event.buttons() as u32;
     }) as Box<dyn FnMut(_)>);
 
-    window
-        .add_event_listener_with_callback("mousemove", closure.as_ref().unchecked_ref())
-        .unwrap();
+    window.add_event_listener_with_callback("mousemove", closure.as_ref().unchecked_ref());
 
-    window
-        .add_event_listener_with_callback("mousedown", closure.as_ref().unchecked_ref())
-        .unwrap();
+    window.add_event_listener_with_callback("mousedown", closure.as_ref().unchecked_ref());
 
-    window
-        .add_event_listener_with_callback("mouseup", closure.as_ref().unchecked_ref())
-        .unwrap();
+    window.add_event_listener_with_callback("mouseup", closure.as_ref().unchecked_ref());
 
-    closure.forget();
+    closure.forget(); // fuck
 }
 
 pub fn initialize_bind_group_texture(
@@ -911,6 +922,35 @@ pub async fn load_image(
     });
 
     anyhow::Ok(channel_bind_group)
+}
+
+fn initialize_datachange_handler(
+    window: &web_sys::Window,
+    canvas: &web_sys::HtmlCanvasElement,
+    refresh_flag: Rc<RefCell<bool>>,
+) -> web_sys::MutationObserver {
+    let observer_func =
+        Closure::<dyn FnMut(JsValue, JsValue)>::new(move |_records: JsValue, _observer| {
+            log::info!("Canvas data changed");
+            refresh_flag.replace(true);
+        });
+    let mutation_observer =
+        web_sys::MutationObserver::new(observer_func.as_ref().unchecked_ref()).unwrap();
+
+    let attribute_filter = JsValue::from(
+        ["data-frag", "data-vert", "data-vertices"]
+            .iter()
+            .copied()
+            .map(JsValue::from)
+            .collect::<js_sys::Array>(),
+    );
+    let mut mutation_observer_init = web_sys::MutationObserverInit::new();
+    mutation_observer_init.attribute_filter(&attribute_filter);
+    mutation_observer.observe_with_options(canvas, &mutation_observer_init);
+
+    observer_func.forget(); // fuck
+
+    mutation_observer
 }
 
 pub fn get_canvas_data(
