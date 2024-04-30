@@ -19,6 +19,60 @@ const CLEAR_COLOR: wgpu::Color = wgpu::Color {
     a: 1.0,
 };
 
+const VERTICES: &[f32] = &[
+    -1.0, -1.0, 0.0, 1.0, // bottom-left
+    1.0, -1.0, 0.0, 1.0, // bottom-right
+    -1.0, 1.0, 0.0, 1.0, // top-left
+    -1.0, 1.0, 0.0, 1.0, // top-left
+    1.0, -1.0, 0.0, 1.0, // bottom-right
+    1.0, 1.0, 0.0, 1.0, // top-right
+];
+
+const SHADER_DEFINES: &str = r###"
+struct Time { frame: u32, elapsed: f32, delta: f32 }
+struct Mouse { pos: vec2<u32>, click: u32 }
+
+@group(0) @binding(0)   var<uniform> _time: Time;
+@group(0) @binding(1)   var<uniform> _mouse: Mouse;
+"###;
+
+const SHADER_VERT_DEFAULT: &str = r###"
+struct VertexInput {
+    @location(0) position: vec4<f32>,
+};
+
+struct VertexOutput {
+    @builtin(position) clip_position: vec4<f32>,
+    @location(0) position: vec2<f32>,
+};
+
+@vertex
+fn vs_main(
+    @builtin(vertex_index) in_vertex_index: u32,
+    in: VertexInput,
+) -> VertexOutput {
+    var out: VertexOutput;
+
+    let x = f32(in.position.x);
+    let y = f32(in.position.y);
+
+    let elapsed = _time.elapsed;
+    let rx = (cos(elapsed) * x) - (sin(elapsed) * y) + f32(_mouse.pos.x) / 1000.0;
+    let ry = (cos(elapsed) * y) + (sin(elapsed) * x) + f32(_mouse.pos.y) / 1000.0;
+    
+    out.clip_position = vec4<f32>(in.position);
+    out.position = vec2<f32>(rx, ry);
+    return out;
+}
+"###;
+
+const SHADER_FRAG_DEFAULT: &str = r###"
+@fragment
+fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
+    return vec4<f32>(in.position, 0.5, 1.0);
+}
+"###;
+
 #[wasm_bindgen]
 pub async fn run() -> Result<(), wasm_bindgen::JsValue> {
     logger::init_logger();
@@ -35,7 +89,7 @@ pub async fn run() -> Result<(), wasm_bindgen::JsValue> {
 
     for canvas in canvas_list {
         let context = Context::new(canvas).await;
-        context_list.push(context);
+        context_list.push(context.expect("Failed to initialize context"));
     }
 
     let time_begin = web_time::Instant::now();
@@ -137,10 +191,13 @@ struct Context<'canvas> {
     channel1_view: wgpu::TextureView,
     time_uniform: TimeUniform,
     mouse_uniform: Rc<RefCell<MouseUniform>>,
+    vertices: Vec<f32>,
+    vertex_buffer: wgpu::Buffer,
+    shader: wgpu::ShaderModule,
 }
 
 impl Context<'_> {
-    async fn new(canvas: web_sys::HtmlCanvasElement) -> Self {
+    async fn new(canvas: web_sys::HtmlCanvasElement) -> anyhow::Result<Self> {
         let (canvas, instance, surface, adapter, device, queue, config) = {
             let (width, height) = (canvas.width(), canvas.height());
 
@@ -184,47 +241,21 @@ impl Context<'_> {
 
         // setup
 
+        let vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Vertex Buffer"),
+            size: 512,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let (vertices, shader_vert, shader_frag) = get_canvas_data(&canvas)?;
         let shader_desc = wgpu::ShaderModuleDescriptor {
             label: None,
             source: wgpu::ShaderSource::Wgsl(
-                r##"
-struct VertexOutput {
-    @builtin(position) clip_position: vec4<f32>,
-    @location(0) position: vec2<f32>,
-};
-
-struct Time { frame: u32, elapsed: f32, delta: f32 }
-struct Mouse { pos: vec2<u32>, click: u32 }
-
-@group(0) @binding(0)   var<uniform> _time: Time;
-@group(0) @binding(1)   var<uniform> _mouse: Mouse;
-
-@vertex
-fn vs_main(
-    @builtin(vertex_index) in_vertex_index: u32,
-) -> VertexOutput {
-    var out: VertexOutput;
-    let x = f32(1 - i32(in_vertex_index)) * 0.5;
-    let y = f32(i32(in_vertex_index & 1u) * 2 - 1) * 0.5;
-
-    let elapsed = _time.elapsed;
-    let rx = (cos(elapsed) * x) - (sin(elapsed) * y) + f32(_mouse.pos.x) / 1000.0;
-    let ry = (cos(elapsed) * y) + (sin(elapsed) * x) + f32(_mouse.pos.y) / 1000.0;
-    
-    out.clip_position = vec4<f32>(x, y, 0.0, 1.0);
-    out.position = vec2<f32>(rx, ry);
-    return out;
-}             
-
-@fragment
-fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
-    return vec4<f32>(in.position, 0.5, 1.0);
-}
-
-"##
-                .into(),
+                format!("{SHADER_DEFINES}{shader_vert}{shader_frag}").into(),
             ),
         };
+        let shader = device.create_shader_module(shader_desc.clone());
 
         let (pipeline_layout, perframe_layout, texture_layout, sampler_layout) =
             initialize_pipeline_layout(&device);
@@ -234,47 +265,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             initialize_bind_group_texture(&device, &texture_layout);
         let sampler_bind_group = initialize_bind_group_sampler(&device, &sampler_layout);
 
-        let shader = device.create_shader_module(shader_desc.clone());
-        let render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("Render Pipeline"),
-            layout: Some(&pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: "vs_main",
-                buffers: &[],
-                compilation_options: wgpu::PipelineCompilationOptions {
-                    ..Default::default()
-                },
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: "fs_main",
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: config.format,
-                    blend: Some(wgpu::BlendState::REPLACE),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-                compilation_options: wgpu::PipelineCompilationOptions {
-                    ..Default::default()
-                },
-            }),
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
-                strip_index_format: None,
-                front_face: wgpu::FrontFace::Ccw,
-                cull_mode: Some(wgpu::Face::Back),
-                unclipped_depth: false,
-                polygon_mode: wgpu::PolygonMode::Fill,
-                conservative: false,
-            },
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState {
-                count: 1,
-                mask: !0,
-                alpha_to_coverage_enabled: false,
-            },
-            multiview: None,
-        });
+        let render_pipeline =
+            Context::setup_pipeline(&device, &pipeline_layout, config.format, &shader);
 
         let time_uniform = TimeUniform {
             frame: 1,
@@ -290,7 +282,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 
         initialize_mouse_handler(&window(), mouse_uniform.clone());
 
-        Context {
+        Ok(Context {
             canvas,
             instance,
             surface,
@@ -312,63 +304,86 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             channel1_view,
             time_uniform,
             mouse_uniform,
-        }
+            vertices,
+            vertex_buffer,
+            shader,
+        })
     }
 
-    fn config_shader(&mut self, shader: &str) {
+    fn setup_pipeline(
+        device: &wgpu::Device,
+        pipeline_layout: &wgpu::PipelineLayout,
+        format: wgpu::TextureFormat,
+        shader: &wgpu::ShaderModule,
+    ) -> wgpu::RenderPipeline {
+        device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Render Pipeline"),
+            layout: Some(pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: "vs_main",
+                buffers: &[wgpu::VertexBufferLayout {
+                    array_stride: (mem::size_of::<f32>() * 4) as wgpu::BufferAddress,
+                    step_mode: wgpu::VertexStepMode::Vertex,
+                    attributes: &wgpu::vertex_attr_array![
+                        0 => Float32x4,
+                    ],
+                }],
+                compilation_options: wgpu::PipelineCompilationOptions {
+                    ..Default::default()
+                },
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: "fs_main",
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: format,
+                    blend: Some(wgpu::BlendState::REPLACE),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: wgpu::PipelineCompilationOptions {
+                    ..Default::default()
+                },
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None,
+                unclipped_depth: false,
+                polygon_mode: wgpu::PolygonMode::Fill,
+                conservative: false,
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState {
+                count: 1,
+                mask: !0,
+                alpha_to_coverage_enabled: false,
+            },
+            multiview: None,
+        })
+    }
+
+    fn config_data(&mut self) -> anyhow::Result<()> {
+        let (vertices, shader_vert, shader_frag) = get_canvas_data(&self.canvas)?;
+
         let shader_desc = wgpu::ShaderModuleDescriptor {
             label: None,
-            source: wgpu::ShaderSource::Wgsl(shader.into()),
+            source: wgpu::ShaderSource::Wgsl(
+                format!("{SHADER_DEFINES}{shader_vert}{shader_frag}").into(),
+            ),
         };
 
         let shader = self.device.create_shader_module(shader_desc.clone());
 
-        let render_pipeline = self
-            .device
-            .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some("Render Pipeline"),
-                layout: Some(&self.pipeline_layout),
-                vertex: wgpu::VertexState {
-                    module: &shader,
-                    entry_point: "vs_main",
-                    buffers: &[],
-                    compilation_options: wgpu::PipelineCompilationOptions {
-                        ..Default::default()
-                    },
-                },
-                fragment: Some(wgpu::FragmentState {
-                    module: &shader,
-                    entry_point: "fs_main",
-                    targets: &[Some(wgpu::ColorTargetState {
-                        format: self.config.format,
-                        blend: Some(wgpu::BlendState::REPLACE),
-                        write_mask: wgpu::ColorWrites::ALL,
-                    })],
-                    compilation_options: wgpu::PipelineCompilationOptions {
-                        ..Default::default()
-                    },
-                }),
-                primitive: wgpu::PrimitiveState {
-                    topology: wgpu::PrimitiveTopology::TriangleList,
-                    strip_index_format: None,
-                    front_face: wgpu::FrontFace::Ccw,
-                    cull_mode: Some(wgpu::Face::Back),
-                    unclipped_depth: false,
-                    polygon_mode: wgpu::PolygonMode::Fill,
-                    conservative: false,
-                },
-                depth_stencil: None,
-                multisample: wgpu::MultisampleState {
-                    count: 1,
-                    mask: !0,
-                    alpha_to_coverage_enabled: false,
-                },
-                multiview: None,
-            });
+        self.render_pipeline = Context::setup_pipeline(
+            &self.device,
+            &self.pipeline_layout,
+            self.config.format,
+            &shader,
+        );
 
-        self.render_pipeline = render_pipeline;
-
-        // todo: reload
+        Ok(())
     }
 
     async fn config_texture(&mut self, channel: ChannelNo, url: &str) -> anyhow::Result<()> {
@@ -382,8 +397,6 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         .await?;
 
         self.texture_bind_group = bind_group;
-
-        // todo: reload
 
         Ok(())
     }
@@ -430,6 +443,12 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             });
 
             self.queue.write_buffer(
+                &self.vertex_buffer,
+                0,
+                bytemuck::cast_slice(self.vertices.as_slice()),
+            );
+
+            self.queue.write_buffer(
                 &self.time_buffer,
                 0,
                 bytemuck::cast_slice(&[self.time_uniform]),
@@ -448,7 +467,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             pass.set_bind_group(0, &self.perframe_bind_group, &[]);
             pass.set_bind_group(1, &self.texture_bind_group, &[]);
             pass.set_bind_group(2, &self.sampler_bind_group, &[]);
-            pass.draw(0..3, 0..1);
+            pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
+            pass.draw(0..(self.vertices.len() as u32), 0..1);
         }
 
         // submit will accept anything that implements IntoIter
@@ -493,7 +513,7 @@ pub async fn initialize_device(adapter: &wgpu::Adapter) -> (wgpu::Device, wgpu::
             &wgpu::DeviceDescriptor {
                 label: None,
                 required_features: wgpu::Features::empty(),
-                required_limits: wgpu::Limits::downlevel_defaults(), //wgpu::Limits::downlevel_webgl2_defaults(),
+                required_limits: wgpu::Limits::downlevel_webgl2_defaults(),
             },
             None, // Trace path
         )
@@ -893,4 +913,36 @@ pub async fn load_image(
     anyhow::Ok(channel_bind_group)
 }
 
-pub fn on_canvas_resize() {}
+pub fn get_canvas_data(
+    canvas: &web_sys::HtmlCanvasElement,
+) -> anyhow::Result<(Vec<f32>, String, String)> {
+    let vertices: Vec<f32>;
+    let data_vertices = canvas.get_attribute("data-vertices");
+    if data_vertices.as_ref().is_some_and(|x| !x.is_empty()) {
+        vertices = data_vertices
+            .unwrap()
+            .split(",")
+            .map(|x| x.parse::<f32>().expect("Failed to parse data-vertices"))
+            .collect::<Vec<f32>>();
+    } else {
+        vertices = VERTICES.to_vec();
+    }
+
+    let mut shader_vert: String;
+    let data_shader_vert = canvas.get_attribute("data-vert");
+    if data_shader_vert.as_ref().is_some_and(|x| !x.is_empty()) {
+        shader_vert = data_shader_vert.unwrap();
+    } else {
+        shader_vert = SHADER_VERT_DEFAULT.to_owned();
+    }
+
+    let mut shader_frag: String;
+    let data_shader_frag = canvas.get_attribute("data-frag");
+    if data_shader_frag.as_ref().is_some_and(|x| !x.is_empty()) {
+        shader_frag = data_shader_frag.unwrap();
+    } else {
+        shader_frag = SHADER_FRAG_DEFAULT.to_owned();
+    }
+
+    Ok((vertices, shader_vert, shader_frag))
+}
