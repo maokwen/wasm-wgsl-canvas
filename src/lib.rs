@@ -32,9 +32,11 @@ const VERTICES: &[f32] = &[
 const SHADER_DEFINES: &str = r###"
 struct Time { frame: u32, elapsed: f32, delta: f32 }
 struct Mouse { pos: vec2<u32>, click: u32 }
+struct Canvas { resolution: vec2<u32> }
 
 @group(0) @binding(0)   var<uniform> _time: Time;
 @group(0) @binding(1)   var<uniform> _mouse: Mouse;
+@group(0) @binding(2)   var<uniform> _canvas: Canvas;
 "###;
 
 const SHADER_VERT_DEFAULT: &str = r###"
@@ -187,6 +189,7 @@ struct Context<'canvas> {
     sampler_bind_group: wgpu::BindGroup,
     time_buffer: wgpu::Buffer,
     mouse_buffer: wgpu::Buffer,
+    canvas_buffer: wgpu::Buffer,
     texture_bindgroup_layout: wgpu::BindGroupLayout,
     channel0_texture: wgpu::Texture,
     channel1_texture: wgpu::Texture,
@@ -194,11 +197,14 @@ struct Context<'canvas> {
     channel1_view: wgpu::TextureView,
     time_uniform: TimeUniform,
     mouse_uniform: Rc<RefCell<MouseUniform>>,
+    canvas_uniform: CanvasUniform,
     vertices: Vec<f32>,
     vertex_buffer: wgpu::Buffer,
     shader: wgpu::ShaderModule,
-    mutation_observer: web_sys::MutationObserver,
+    refresh_observer: web_sys::MutationObserver,
     refresh_flag: Rc<RefCell<bool>>,
+    resize_observer: web_sys::MutationObserver,
+    resize_flag: Rc<RefCell<bool>>,
 }
 
 impl Context<'_> {
@@ -264,8 +270,8 @@ impl Context<'_> {
 
         let (pipeline_layout, perframe_layout, texture_layout, sampler_layout) =
             initialize_pipeline_layout(&device);
-        let (perframe_bind_group, time_buffer, mouse_buffer) =
-            initialize_bind_group_perframe(&device, &perframe_layout);
+        let (perframe_bind_group, time_buffer, mouse_buffer, canvas_buffer) =
+            initialize_bind_group_0(&device, &perframe_layout);
         let (texture_bind_group, channel0_texture, channel0_view, channel1_texture, channel1_view) =
             initialize_bind_group_texture(&device, &texture_layout);
         let sampler_bind_group = initialize_bind_group_sampler(&device, &sampler_layout);
@@ -285,11 +291,24 @@ impl Context<'_> {
             _padding: 0,
         }));
 
-        let refresh_flag = Rc::new(RefCell::new(false));
+        let canvas_uniform = CanvasUniform {
+            resolution: [config.width, config.height],
+        };
+        queue.write_buffer(
+            &canvas_buffer,
+            0,
+            bytemuck::cast_slice(&[canvas_uniform]),
+        );
 
         initialize_mouse_handler(&window(), mouse_uniform.clone());
-        let mutation_observer =
+
+        let refresh_flag = Rc::new(RefCell::new(false));
+        let refresh_observer =
             initialize_datachange_handler(&window(), &canvas, refresh_flag.clone());
+
+        let resize_flag = Rc::new(RefCell::new(false));
+        let resize_observer =
+            initialize_sizechange_handler(&window(), &canvas, resize_flag.clone());
 
         Ok(Context {
             canvas,
@@ -313,11 +332,15 @@ impl Context<'_> {
             channel1_view,
             time_uniform,
             mouse_uniform,
+            canvas_uniform,
             vertices,
             vertex_buffer,
             shader,
-            mutation_observer,
+            refresh_observer,
             refresh_flag,
+            canvas_buffer,
+            resize_observer,
+            resize_flag,
         })
     }
 
@@ -422,6 +445,12 @@ impl Context<'_> {
         self.config.width = width;
         self.config.height = height;
         self.surface.configure(&self.device, &self.config);
+        self.canvas_uniform.resolution = [width, height];
+        self.queue.write_buffer(
+            &self.canvas_buffer,
+            0,
+            bytemuck::cast_slice(&[self.canvas_uniform]),
+        );
     }
 
     fn input(&self) {}
@@ -430,6 +459,10 @@ impl Context<'_> {
         if *self.refresh_flag.borrow() {
             self.config_data();
             self.refresh_flag.replace(false);
+        }
+        if *self.resize_flag.borrow() {
+            self.resize();
+            self.resize_flag.replace(false);
         }
     }
 
@@ -553,6 +586,7 @@ pub fn initialize_pipeline_layout(
     // group(0)
     // binding(0) var<uniform> _time: Time { frame, elapsed }
     // binding(1) var<uniform> _mouse: Mouse { pos, click }
+    // binding(2) var<uniform> _canvas: Canvas { resolution }
     let perframe_bind_group_layout =
         device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("Bind Group Layout"),
@@ -569,6 +603,16 @@ pub fn initialize_pipeline_layout(
                 },
                 wgpu::BindGroupLayoutEntry {
                     binding: 1,
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
                     visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
@@ -680,12 +724,19 @@ struct MouseUniform {
     _padding: u32, // in wgsl all fields will be aligned to 4, 8, 16 bytes
 }
 
-pub fn initialize_bind_group_perframe(
+#[repr(C)]
+#[derive(Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+struct CanvasUniform {
+    resolution: [u32; 2],
+}
+
+pub fn initialize_bind_group_0(
     device: &wgpu::Device,
     layout: &wgpu::BindGroupLayout,
-) -> (wgpu::BindGroup, wgpu::Buffer, wgpu::Buffer) {
+) -> (wgpu::BindGroup, wgpu::Buffer, wgpu::Buffer, wgpu::Buffer) {
     // binding(0) var<uniform> _time: Time { frame, elapsed }
     // binding(1) var<uniform> _mouse: Mouse { pos, click }
+    // binding(2) var<uniform> _canvas: Canvas { resolution }
 
     let time_buffer = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("_time Buffer"),
@@ -697,6 +748,13 @@ pub fn initialize_bind_group_perframe(
     let mouse_buffer = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("_mouse Buffer"),
         size: mem::size_of::<MouseUniform>() as wgpu::BufferAddress,
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+
+    let canvas_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("_canvas Buffer"),
+        size: mem::size_of::<CanvasUniform>() as wgpu::BufferAddress,
         usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
@@ -713,10 +771,14 @@ pub fn initialize_bind_group_perframe(
                 binding: 1,
                 resource: mouse_buffer.as_entire_binding(),
             },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: canvas_buffer.as_entire_binding(),
+            },
         ],
     });
 
-    (bind_group, time_buffer, mouse_buffer)
+    (bind_group, time_buffer, mouse_buffer, canvas_buffer)
 }
 
 fn initialize_mouse_handler(window: &web_sys::Window, mouse: Rc<RefCell<MouseUniform>>) {
@@ -939,6 +1001,35 @@ fn initialize_datachange_handler(
 
     let attribute_filter = JsValue::from(
         ["data-frag", "data-vert", "data-vertices"]
+            .iter()
+            .copied()
+            .map(JsValue::from)
+            .collect::<js_sys::Array>(),
+    );
+    let mut mutation_observer_init = web_sys::MutationObserverInit::new();
+    mutation_observer_init.attribute_filter(&attribute_filter);
+    mutation_observer.observe_with_options(canvas, &mutation_observer_init);
+
+    observer_func.forget(); // fuck
+
+    mutation_observer
+}
+
+fn initialize_sizechange_handler(
+    window: &web_sys::Window,
+    canvas: &web_sys::HtmlCanvasElement,
+    resize_flag: Rc<RefCell<bool>>,
+) -> web_sys::MutationObserver {
+    let observer_func =
+        Closure::<dyn FnMut(JsValue, JsValue)>::new(move |_records: JsValue, _observer| {
+            log::info!("Canvas size changed");
+            resize_flag.replace(true);
+        });
+    let mutation_observer =
+        web_sys::MutationObserver::new(observer_func.as_ref().unchecked_ref()).unwrap();
+
+    let attribute_filter = JsValue::from(
+        ["width", "height"]
             .iter()
             .copied()
             .map(JsValue::from)
